@@ -1,0 +1,196 @@
+---
+title: "Analiza Spotify a zdrowie psychiczne"
+author: "Michał Błoch"
+date: "2026-01-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Ładowanie bibliotek
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(broom)
+library(scales)
+```
+
+## Wczytanie danych
+
+```{r load-data}
+setwd("/Users/michalbloch/Downloads")
+mxmh <- read.csv("mxmh_survey_results.csv", check.names=FALSE)
+spotify <- bind_rows(
+  read.csv("high_popularity_spotify_data.csv"),
+  read.csv("low_popularity_spotify_data.csv")
+)
+```
+
+## Przygotowanie danych ankiety
+
+```{r prepare-survey}
+genre_cols <- c(
+  "Frequency [Classical]","Frequency [Country]","Frequency [EDM]",
+  "Frequency [Folk]","Frequency [Gospel]","Frequency [Hip hop]",
+  "Frequency [Jazz]","Frequency [K pop]","Frequency [Latin]",
+  "Frequency [Lofi]","Frequency [Metal]","Frequency [Pop]",
+  "Frequency [R&B]","Frequency [Rap]","Frequency [Rock]",
+  "Frequency [Video game music]"
+)
+freq_map <- c("Never"=0,"Rarely"=1,"Sometimes"=2,"Very frequently"=3)
+
+mxmh_num <- mxmh %>%
+  select(`Fav genre`, Anxiety, Depression, Insomnia, OCD, all_of(genre_cols)) %>%
+  mutate(across(all_of(genre_cols), ~ freq_map[.x]))
+
+genre_mapping <- c(
+  "Frequency [Classical]"="classical",
+  "Frequency [Country]"="country",
+  "Frequency [EDM]"="edm",
+  "Frequency [Folk]"="folk",
+  "Frequency [Gospel]"="gospel",
+  "Frequency [Hip hop]"="hip hop",
+  "Frequency [Jazz]"="jazz",
+  "Frequency [K pop]"="k pop",
+  "Frequency [Latin]"="latin",
+  "Frequency [Lofi]"="lofi",
+  "Frequency [Metal]"="metal",
+  "Frequency [Pop]"="pop",
+  "Frequency [R&B]"="r&b",
+  "Frequency [Rap]"="rap",
+  "Frequency [Rock]"="rock",
+  "Frequency [Video game music]"="video game music"
+)
+
+mxmh_long <- mxmh_num %>%
+  pivot_longer(cols=all_of(genre_cols), names_to="genre", values_to="frequency") %>%
+  mutate(genre = tolower(genre_mapping[genre])) %>%
+  filter(frequency>0)
+```
+
+## Przygotowanie danych Spotify
+
+```{r prepare-spotify}
+audio_cols <- c("energy","valence","tempo","danceability",
+                "loudness","acousticness","instrumentalness","speechiness")
+
+audio_scaled <- spotify %>%
+  select(playlist_genre, all_of(audio_cols)) %>%
+  drop_na() %>%
+  mutate(across(-playlist_genre, scale)) %>%
+  mutate(playlist_genre = tolower(trimws(playlist_genre)))
+
+joined_test <- mxmh_long %>%
+  left_join(audio_scaled, by=c("genre"="playlist_genre"))
+
+joined_test_clean <- joined_test %>%
+  drop_na(all_of(audio_cols))
+```
+
+## Eksploracja danych
+
+```{r exploration-stats}
+health_vars <- c("Anxiety","Depression","Insomnia","OCD")
+
+summary(joined_test_clean)
+sapply(joined_test_clean, function(x) sum(is.na(x)))
+```
+
+### Histogramy
+
+```{r histograms, fig.height=6, fig.width=10}
+for(var in health_vars){
+  p <- ggplot(joined_test_clean, aes_string(x=var)) +
+    geom_histogram(bins=10, fill="skyblue", color="black") +
+    scale_y_continuous(labels=comma) +
+    theme_minimal() +
+    labs(title=paste("Histogram:",var), x=var, y="Liczba obserwacji")
+  print(p)
+}
+```
+
+### Boxploty
+
+```{r boxplots, fig.height=8, fig.width=10}
+for(col in audio_cols){
+  p <- ggplot(joined_test_clean, aes_string(y=col)) +
+    geom_boxplot(fill="salmon") +
+    theme_minimal() +
+    labs(title=paste("Boxplot:",col), y=col)
+  print(p)
+}
+```
+
+## Korelacja Spearmana
+
+```{r spearman-function}
+test_spearman_verbose <- function(df, health_var){
+  problem_cols <- audio_cols[sapply(df[audio_cols], function(x) all(is.na(x)))]
+  valid_cols <- setdiff(audio_cols, problem_cols)
+  if(length(valid_cols)<1) return(NULL)
+  
+  df_clean <- df %>%
+    select(all_of(c(valid_cols, health_var))) %>%
+    filter(complete.cases(.))
+  if(nrow(df_clean)<2) return(NULL)
+  
+  cor_values <- sapply(valid_cols, function(col){
+    cor(df_clean[[col]], df_clean[[health_var]], method="spearman")
+  })
+  data.frame(feature=valid_cols, correlation=cor_values)
+}
+```
+
+```{r spearman-plots, fig.height=6, fig.width=10}
+plot_health_correlation <- function(df, health_var){
+  cor_df <- test_spearman_verbose(df, health_var)
+  if(is.null(cor_df)) return(NULL)
+  
+  max_abs <- max(abs(cor_df$correlation), na.rm=TRUE)
+  
+  p <- ggplot(cor_df, aes(x=feature, y=correlation, fill=correlation)) +
+    geom_col() +
+    coord_flip() +
+    theme_minimal() +
+    scale_y_continuous(limits=c(-max_abs,max_abs), expand=c(0,0)) +
+    scale_fill_gradient2(low="darkblue", mid="white", high="dodgerblue", midpoint=0) +
+    labs(title=paste("Spearman korelacje cech audio z poziomem", health_var),
+         x="Cecha audio", y="Spearman rho")
+  print(p)
+}
+
+for(var in health_vars){
+  plot_health_correlation(joined_test_clean, var)
+}
+```
+
+## Regresja liniowa
+
+```{r regression, fig.height=6, fig.width=10}
+linear_models <- list()
+coef_tables <- list()
+coef_plots <- list()
+
+for(var in health_vars){
+  formula <- as.formula(paste(var,"~",paste(audio_cols,collapse=" + ")))
+  model <- lm(formula, data=joined_test_clean)
+  linear_models[[var]] <- model
+  
+  coef_df <- broom::tidy(model) %>%
+    filter(term!="(Intercept)") %>%
+    arrange(desc(abs(estimate)))
+  coef_tables[[var]] <- coef_df
+  
+  max_abs <- max(abs(coef_df$estimate))
+  
+  p <- ggplot(coef_df, aes(x=reorder(term,estimate), y=estimate, fill=estimate)) +
+    geom_col() +
+    coord_flip() +
+    theme_minimal() +
+    scale_y_continuous(limits=c(-max_abs,max_abs), expand=c(0,0)) +
+    scale_fill_gradient2(low="darkred", mid="white", high="darkgreen", midpoint=0) +
+    labs(title=paste("Wpływ cech audio na",var),
+         x="Cecha audio", y="Współczynnik regresji")
+  print(p)
+  coef_plots[[var]] <- p
+}
+```
